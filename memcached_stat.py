@@ -1,3 +1,4 @@
+import bmemcached
 import collectd
 import socket
 import re
@@ -8,29 +9,24 @@ VERBOSE_LOGGING = False
 # Global settings, one entry per instance
 CONFIGS = []
 
+class EmptyString:
+  def __str__(self):
+    return ''
+
 def get_memcached_stats(conf):
     stats={}
     # connect to memcached
     try:
-        # TODO: use python-memcached to get these stats, available in centos7
-        # (centos6 doesn't have a recent version that supports more than basic stats)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect((conf['host'], conf['port']))
-        log_verbose("connected to memcached port %d"%conf['port'])
+        connection_string = "%s:%d"%(conf['host'],conf['port'])
+        client = bmemcached.Client(connection_string, conf['instance'], EmptyString())
+        log_verbose("Connection string=%s (instance=%s)"%(connection_string, conf['instance']))
+        for verb in ['', 'slabs', 'items']:
+            s = client.stats(verb)
+            assert(len(s) == 1) # we have only one host
+            stats[verb]=s[connection_string]
     except socket.error, e:
         collectd.error('memcached_stat plugin: Error connecting to %d - %r'
                        % (conf['port'], e))
-    fp=s.makefile()
-    for verb in ['', 'slabs', 'items']:
-        stats[verb]=[]
-        s.sendall("stats %s\n"%verb)
-        log_verbose("query stats %s"%verb)
-        while True:
-            line=fp.readline()
-            if line.startswith("END"):
-                break
-            # skip the 'STAT' word at the beginning of the line
-            stats[verb].append(line.split()[1:3])
     log_verbose("done extracting stats")
     return stats
 
@@ -69,44 +65,41 @@ def make_synthetic_stats(stats):
     # create the slab memory size (chunk_size*total_chunks for each slabs)
     chunk_sizes={}
     total_chunks={}
-    for s in stats['slabs']:
-        if ':' not in s[0]:
+    for k,v in stats['slabs'].iteritems():
+        if ':' not in k:
             continue
-        slabid, key = s[0].split(':')
+        slabid, key = k.split(':')
         if key == 'chunk_size':
-            chunk_sizes[slabid] = s[1]
+            chunk_sizes[slabid] = int(v)
         elif key == 'total_chunks':
-            total_chunks[slabid] = s[1]
+            total_chunks[slabid] = int(v)
     # prepare the intersection of keys in both maps
     slabids = set(chunk_sizes.keys()) & set(total_chunks.keys())
     log_verbose("preparing synthetic metrics for %d slabs"%len(slabids))
     for slabid in slabids:
-        stats['slabs'].append(["synth:%s:slab_size"%slabid, int(chunk_sizes[slabid])*int(total_chunks[slabid])])
-        log_verbose("memcached_stats plugin: craeted a synthetic slab_size metric for slabid %s"%slabid)
+        stats['slabs']["synth:%s:slab_size"%slabid] = chunk_sizes[slabid] * total_chunks[slabid]
+        log_verbose("memcached_stats plugin: created a synthetic slab_size metric for slabid %s"%slabid)
 
 def read_callback():
     for conf in CONFIGS:
         stats=get_memcached_stats(conf)
         make_synthetic_stats(stats)
         for verb,stat in stats.iteritems():
-            stat = filter(lambda s: s[0].split(':')[-1] in conf['filtered_stat_types'], stat)
+            # filtering stats that are mentionned in the configuration
+            fstat = dict((k, v) for k, v in stat.iteritems() if k.split(':')[-1] in conf['filtered_stat_types'])
             # fix keys by prepending the verb if it doesn't exist
-            stat=map(lambda s: [verb+':'+s[0],s[1]] if not s[0].startswith(verb) else s, stat)
-            for s in stat:
-                log_verbose("Having a stat[%s]=%s"%(s[0], s[1]))
-                dispatch_value(s[0],conf['filtered_stat_types'][s[0].split(':')[-1]],s[1], conf['instance'])
+            ffstat = dict((verb+':'+k if not k.startswith(verb) else k, v) for k, v in fstat.iteritems())
+            for k, v in ffstat.iteritems():
+                dispatch_value(k, conf['filtered_stat_types'][k.split(':')[-1]], v, conf['instance'])
 
 def dispatch_value(key, type, value, plugin_instance=None, type_instance=None):
     """Read a key from info response data and dispatch a value"""
     if plugin_instance is None:
         plugin_instance = 'unknown memcached'
         collectd.error('memcached_stats plugin: plugin_instance is not set, Info key: %s' % key)
-
     if not type_instance:
         type_instance = key
-
     log_verbose('Sending value: %s=%s' % (type_instance, value))
-
     val = collectd.Values(plugin='memcached')
     val.type = type
     val.type_instance = type_instance
